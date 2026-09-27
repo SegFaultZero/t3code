@@ -83,13 +83,20 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
   yield* fs.chmod(helperPath, 0o755).pipe(Effect.orElseSucceed(() => undefined));
 });
 
-// node-pty now defers Windows process creation to avoid blocking on named pipes:
-// https://github.com/microsoft/node-pty/pull/885
-// T3 adopted that behavior when upgrading from 1.1.0 to 1.2.0-beta.15:
-// https://github.com/pingdotgg/t3code/pull/13748
-// Its public API has no readiness event. The private ready_datapipe handler sets
-// pid before our listener runs; wait here so the manager always receives a real PID.
-const waitForWindowsPid = (process: import("node-pty").IPty, shell: string) =>
+/**
+ * Waits for Windows process creation so the manager receives a valid PID.
+ * node-pty defers creation to avoid blocking on named pipes:
+ * https://github.com/microsoft/node-pty/pull/885
+ * T3 adopted that behavior when upgrading from 1.1.0 to 1.2.0-beta.15:
+ * https://github.com/pingdotgg/t3code/pull/13748
+ * Its public API has no readiness event. The private ready_datapipe handler sets
+ * pid before our listener runs.
+ */
+const waitForWindowsPid = (
+  process: import("node-pty").IPty,
+  trackedProcess: NodePtyProcess,
+  shell: string,
+) =>
   Effect.callback<void, PtyAdapter.PtySpawnError>((resume) => {
     const hasPid = () => Number.isInteger(process.pid) && process.pid > 0;
     const failure = (cause: unknown) =>
@@ -119,27 +126,31 @@ const waitForWindowsPid = (process: import("node-pty").IPty, shell: string) =>
       resume(failure(cause));
     };
     const onClose = () => onError(new Error("Windows PTY closed before its PID was available."));
-    const exitListener = process.onExit(({ exitCode }) =>
-      onError(
-        new Error(`Windows PTY exited before its PID was available (exit code ${exitCode}).`),
-      ),
-    );
+    let stopExit = () => {};
     const cleanup = () => {
       socket.off("ready_datapipe", onReady);
       socket.off("error", onError);
       socket.off("close", onClose);
-      exitListener.dispose();
+      stopExit();
     };
     socket.once("ready_datapipe", onReady);
     socket.once("error", onError);
     socket.once("close", onClose);
+    stopExit = trackedProcess.onExit(({ exitCode }) =>
+      onError(
+        new Error(`Windows PTY exited before its PID was available (exit code ${exitCode}).`),
+      ),
+    );
     return Effect.sync(cleanup);
   });
 
+/**
+ * Cancels Windows startup without waiting for the first output, unlike public kill().
+ * The private agent can cancel the pending connection before a child exists.
+ * Cleanup failures are logged without replacing the startup failure.
+ */
 const killStartingWindowsPty = (process: import("node-pty").IPty) =>
   Effect.try(() => {
-    // Public kill() waits for the first output on Windows. The agent can cancel
-    // the pending connection even when no child or output exists yet.
     if (
       "_agent" in process &&
       typeof process._agent === "object" &&
@@ -151,15 +162,33 @@ const killStartingWindowsPty = (process: import("node-pty").IPty) =>
     } else {
       process.kill();
     }
-  }).pipe(Effect.ignore);
+  }).pipe(
+    Effect.catch((error) =>
+      Effect.logWarning("failed to cancel Windows terminal startup", {
+        terminalPid: process.pid,
+        cause: error,
+      }),
+    ),
+  );
 
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
+  private exitEvent: PtyAdapter.PtyExitEvent | undefined;
+  private readonly exitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  private readonly exitSubscription: import("node-pty").IDisposable;
 
   constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
     this.process = process;
     this.platform = platform;
+    // Retain exits while Windows readiness and the manager hand off the process.
+    this.exitSubscription = process.onExit((event) => {
+      if (this.exitEvent) return;
+      this.exitEvent = { exitCode: event.exitCode, signal: event.signal ?? null };
+      this.exitSubscription.dispose();
+      for (const listener of this.exitListeners) listener(this.exitEvent);
+      this.exitListeners.clear();
+    });
   }
 
   get pid(): number {
@@ -187,15 +216,19 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
   }
 
   onExit(callback: (event: PtyAdapter.PtyExitEvent) => void): () => void {
-    const disposable = this.process.onExit((event) => {
-      callback({
-        exitCode: event.exitCode,
-        signal: event.signal ?? null,
-      });
-    });
+    if (this.exitEvent) {
+      callback(this.exitEvent);
+      return () => {};
+    }
+    this.exitListeners.add(callback);
     return () => {
-      disposable.dispose();
+      this.exitListeners.delete(callback);
     };
+  }
+
+  disposeExitSubscription(): void {
+    this.exitSubscription.dispose();
+    this.exitListeners.clear();
   }
 }
 
@@ -237,14 +270,16 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
           ? { ...input.env, TERM: "xterm-256color" }
           : input.env;
       const ptyProcess = yield* Effect.try({
-        try: () =>
-          nodePty.spawn(input.shell, input.args ?? [], {
+        try: () => {
+          const nativeProcess = nodePty.spawn(input.shell, input.args ?? [], {
             cwd: input.cwd,
             cols: input.cols,
             rows: input.rows,
             env,
             name: "xterm-256color",
-          }),
+          });
+          return { nativeProcess, process: new NodePtyProcess(nativeProcess, platform) };
+        },
         catch: (cause) =>
           new PtyAdapter.PtySpawnError({
             adapter: "node-pty",
@@ -253,11 +288,15 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
           }),
       });
       if (platform === "win32") {
-        yield* waitForWindowsPid(ptyProcess, input.shell).pipe(
-          Effect.onError(() => killStartingWindowsPty(ptyProcess)),
+        yield* waitForWindowsPid(ptyProcess.nativeProcess, ptyProcess.process, input.shell).pipe(
+          Effect.onError(() =>
+            Effect.sync(() => ptyProcess.process.disposeExitSubscription()).pipe(
+              Effect.andThen(killStartingWindowsPty(ptyProcess.nativeProcess)),
+            ),
+          ),
         );
       }
-      return new NodePtyProcess(ptyProcess, platform);
+      return ptyProcess.process;
     }),
   });
 });

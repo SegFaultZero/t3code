@@ -9,7 +9,9 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import { vi } from "vite-plus/test";
+import * as Logger from "effect/Logger";
+import * as Scheduler from "effect/Scheduler";
+import { expect, vi } from "vite-plus/test";
 
 import * as NodePtyAdapter from "./NodePtyAdapter.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
@@ -93,7 +95,7 @@ it.effect("waits for the Windows PID without requiring output", () =>
     const process = yield* Fiber.join(fiber);
     assert.equal(process.pid, 12345);
     assert.equal(nativeProcess._socket.listenerCount("ready_datapipe"), 0);
-    assert.equal(nativeProcess.events.listenerCount("exit"), 0);
+    assert.equal(nativeProcess.events.listenerCount("exit"), 1);
 
     const output: string[] = [];
     const exits: PtyAdapter.PtyExitEvent[] = [];
@@ -276,3 +278,88 @@ it.effect("reports native module load failures as structured startup defects", (
     ),
   ),
 );
+
+for (const budget of [2048, 8]) {
+  it.effect(`preserves an exit during readiness handoff with scheduler budget ${budget}`, () =>
+    Effect.gen(function* () {
+      const { nativeProcess, subscribed } = preparePendingProcess();
+      const adapter = yield* PtyAdapter.PtyAdapter;
+      const exits: PtyAdapter.PtyExitEvent[] = [];
+      const fiber = yield* Effect.gen(function* () {
+        const process = yield* adapter.spawn(spawnInput);
+        process.onExit((event) => exits.push(event));
+      }).pipe(
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, budget),
+        Effect.provideService(Scheduler.PreventSchedulerYield, false),
+        Effect.forkChild,
+      );
+      yield* subscribed;
+      nativeProcess.pid = 12345;
+      nativeProcess._socket.emit("ready_datapipe");
+      nativeProcess.events.emit("exit", { exitCode: 0 });
+      yield* Fiber.join(fiber);
+      assert.equal(exits.length, 1);
+    }).pipe(Effect.provide(testLayer)),
+  );
+}
+
+it.effect("replays an exit to late subscribers and respects unsubscription", () =>
+  Effect.gen(function* () {
+    const adapter = yield* PtyAdapter.PtyAdapter;
+    const process = yield* adapter.spawn(spawnInput);
+    const nativeProcess = spawn.mock.results.at(-1)!.value;
+    const removed = vi.fn();
+    process.onExit(removed)();
+    nativeProcess.events.emit("exit", { exitCode: 7, signal: 2 });
+    const late = vi.fn();
+    process.onExit(late);
+    nativeProcess.events.emit("exit", { exitCode: 9 });
+    assert.equal(removed.mock.calls.length, 0);
+    assert.deepEqual(late.mock.calls, [[{ exitCode: 7, signal: 2 }]]);
+    assert.equal(nativeProcess.events.listenerCount("exit"), 0);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+for (const failure of ["spawn", "interrupt"] as const) {
+  it.effect(`logs cleanup failures without replacing ${failure}`, () =>
+    Effect.gen(function* () {
+      const { nativeProcess, subscribed } = preparePendingProcess();
+      const killError = new Error("native kill failed");
+      nativeProcess._agent.kill.mockImplementation(() => {
+        throw killError;
+      });
+      const messages: unknown[] = [];
+      const logger = Logger.make(({ message }) => {
+        messages.push(message);
+      });
+      const adapter = yield* PtyAdapter.PtyAdapter;
+      const fiber = yield* adapter
+        .spawn(spawnInput)
+        .pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
+      yield* subscribed;
+      const spawnError = new Error("pipe failed");
+      if (failure === "interrupt") yield* Fiber.interrupt(fiber);
+      else nativeProcess._socket.emit("error", spawnError);
+      const exit = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        if (failure === "interrupt") assert.isTrue(Cause.hasInterrupts(exit.cause));
+        else {
+          const error = Cause.squash(exit.cause);
+          assert.instanceOf(error, PtyAdapter.PtySpawnError);
+          assert.equal(error.cause, spawnError);
+        }
+      }
+      assert.equal(messages.length, 1);
+      expect(messages[0]).toMatchObject([
+        "failed to cancel Windows terminal startup",
+        { terminalPid: 0, cause: { cause: killError } },
+      ]);
+      assert.equal(nativeProcess.events.listenerCount("exit"), 0);
+      assert.equal(nativeProcess._socket.listenerCount("ready_datapipe"), 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+}

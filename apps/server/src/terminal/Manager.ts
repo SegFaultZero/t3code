@@ -276,7 +276,7 @@ interface TerminalSessionState {
   cwd: string;
   worktreePath: string | null;
   status: TerminalSessionStatus;
-  pid: number | null;
+  readonly pid: number | null;
   history: BoundedTerminalHistory;
   pendingHistoryControlSequence: string;
   pendingProcessEvents: Array<PendingProcessEvent>;
@@ -364,6 +364,13 @@ function terminalWireLabel(session: TerminalSessionState): string {
     }
   }
   return truncateTerminalWireLabel(getTerminalLabel(session.terminalId));
+}
+
+// ConPTY assigns the PID asynchronously. Read it from the process instead of
+// freezing its startup sentinel into snapshots and subprocess checks.
+function terminalProcessPid(process: PtyAdapter.PtyProcess | null): number | null {
+  const pid = process?.pid;
+  return pid !== undefined && Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
 function snapshot(session: TerminalSessionState): TerminalSessionSnapshot {
@@ -463,10 +470,10 @@ function cleanupProcessHandles(session: TerminalSessionState): void {
 
 function enqueueProcessEvent(
   session: TerminalSessionState,
-  expectedPid: number,
+  expectedProcess: PtyAdapter.PtyProcess,
   event: PendingProcessEvent,
 ): boolean {
-  if (!session.process || session.status !== "running" || session.pid !== expectedPid) {
+  if (!session.process || session.status !== "running" || session.process !== expectedProcess) {
     return false;
   }
 
@@ -2001,11 +2008,15 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   const drainProcessEvents = Effect.fn("terminal.drainProcessEvents")(function* (
     session: TerminalSessionState,
-    expectedPid: number,
+    expectedProcess: PtyAdapter.PtyProcess,
   ) {
     while (true) {
       const action: DrainProcessEventAction = yield* Effect.sync(() => {
-        if (session.pid !== expectedPid || !session.process || session.status !== "running") {
+        if (
+          session.process !== expectedProcess ||
+          !session.process ||
+          session.status !== "running"
+        ) {
           session.pendingProcessEvents = [];
           session.pendingProcessEventIndex = 0;
           session.processEventDrainRunning = false;
@@ -2050,7 +2061,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         const process = session.process;
         cleanupProcessHandles(session);
         session.process = null;
-        session.pid = null;
         session.hasRunningSubprocess = false;
         session.childCommandLabel = null;
         session.status = "exited";
@@ -2122,7 +2132,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     yield* modifyManagerState((state) => {
       cleanupProcessHandles(session);
       session.process = null;
-      session.pid = null;
       session.hasRunningSubprocess = false;
       session.childCommandLabel = null;
       session.status = "exited";
@@ -2242,18 +2251,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             ptyProcess = spawnResult.process;
             startedShell = spawnResult.shellLabel;
 
-            const processPid = ptyProcess.pid;
+            const process = ptyProcess;
             const unsubscribeData = ptyProcess.onData((data) => {
-              if (!enqueueProcessEvent(session, processPid, { type: "output", data })) {
+              if (!enqueueProcessEvent(session, process, { type: "output", data })) {
                 return;
               }
-              runFork(drainProcessEvents(session, processPid));
+              runFork(drainProcessEvents(session, process));
             });
             const unsubscribeExit = ptyProcess.onExit((event) => {
-              if (!enqueueProcessEvent(session, processPid, { type: "exit", event })) {
+              if (!enqueueProcessEvent(session, process, { type: "exit", event })) {
                 return;
               }
-              runFork(drainProcessEvents(session, processPid));
+              runFork(drainProcessEvents(session, process));
             });
 
             let eventStamp: ReturnType<typeof advanceEventSequence> = {
@@ -2262,7 +2271,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             };
             yield* modifyManagerState((state) => {
               session.process = ptyProcess;
-              session.pid = processPid;
               session.status = "running";
               session.unsubscribeData = unsubscribeData;
               session.unsubscribeExit = unsubscribeExit;
@@ -2295,7 +2303,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       yield* modifyManagerState((state) => {
         cleanupProcessHandles(session);
         session.status = "error";
-        session.pid = null;
         session.process = null;
         session.hasRunningSubprocess = false;
         session.childCommandLabel = null;
@@ -2550,7 +2557,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         cwd: input.cwd,
         worktreePath: input.worktreePath ?? null,
         status: "starting",
-        pid: null,
+        get pid() {
+          return terminalProcessPid(this.process);
+        },
         history,
         pendingHistoryControlSequence: "",
         pendingProcessEvents: [],
@@ -2973,7 +2982,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           cwd: input.cwd,
           worktreePath: input.worktreePath ?? null,
           status: "starting",
-          pid: null,
+          get pid() {
+            return terminalProcessPid(this.process);
+          },
           history: new BoundedTerminalHistory(historyLineLimit, "", historyByteLimit),
           pendingHistoryControlSequence: "",
           pendingProcessEvents: [],

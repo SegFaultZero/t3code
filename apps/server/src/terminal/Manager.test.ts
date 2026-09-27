@@ -11,6 +11,8 @@ import {
   ProviderInstanceId,
   ServerSettingsError,
   TerminalProviderInstanceNotFoundError,
+  TerminalSessionSnapshot,
+  TerminalSummary,
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Data from "effect/Data";
@@ -28,6 +30,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -42,6 +45,9 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "./Manager.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
 
+const encodeTerminalSnapshot = Schema.encodeEffect(TerminalSessionSnapshot);
+const encodeTerminalSummary = Schema.encodeEffect(TerminalSummary);
+
 class WaitForConditionError extends Data.TaggedError("WaitForConditionError")<{
   readonly message: string;
 }> {}
@@ -50,7 +56,7 @@ class FakePtyProcess implements PtyAdapter.PtyProcess {
   readonly writes: string[] = [];
   readonly resizeCalls: Array<{ cols: number; rows: number }> = [];
   readonly killSignals: Array<string | undefined> = [];
-  readonly pid: number;
+  pid: number;
   writeFailure: unknown | undefined;
   resizeFailure: unknown | undefined;
   private readonly dataListeners = new Set<(data: string) => void>();
@@ -112,7 +118,7 @@ class FakePtyAdapter {
   readonly processes: FakePtyProcess[] = [];
   readonly spawnFailures: Error[] = [];
   private readonly mode: "sync" | "async";
-  private nextPid = 9000;
+  nextPid = 9000;
 
   constructor(mode: "sync" | "async" = "sync") {
     this.mode = mode;
@@ -639,6 +645,78 @@ it.layer(
       assert.equal(snapshot.status, "running");
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
       expect(ptyAdapter.processes).toHaveLength(1);
+    }),
+  );
+
+  it.effect("keeps Windows terminals usable while ConPTY assigns the PID", () =>
+    Effect.gen(function* () {
+      const adapter = new FakePtyAdapter();
+      adapter.nextPid = 0;
+      const inspectedPids: number[] = [];
+      const { manager } = yield* createManager(5, {
+        ptyAdapter: adapter,
+        subprocessInspector: (pid) =>
+          Effect.sync(() => {
+            inspectedPids.push(pid);
+            return { hasRunningSubprocess: true, childCommand: "node", processIds: [pid] };
+          }),
+      });
+      const readMetadata = Effect.gen(function* () {
+        let terminals: ReadonlyArray<TerminalSummary> = [];
+        const unsubscribe = yield* manager.subscribeMetadata((event) =>
+          Effect.sync(() => {
+            if (event.type === "snapshot") terminals = event.terminals;
+          }),
+        );
+        unsubscribe();
+        return terminals;
+      });
+      const initial = yield* manager.open(openInput());
+      assert.equal(initial.pid, null);
+      yield* encodeTerminalSnapshot(initial);
+
+      const metadata = yield* readMetadata;
+      assert.equal(metadata[0]?.pid, null);
+      yield* Effect.forEach(metadata, (item) => encodeTerminalSummary(item));
+      yield* manager.closeIdle({ threadId: "thread-1" });
+      expect(inspectedPids).toEqual([]);
+
+      const attached = yield* Ref.make<ReadonlyArray<TerminalAttachStreamEvent>>([]);
+      const unsubscribeAttach = yield* manager.attachStream(openInput(), (event) =>
+        Ref.update(attached, (events) => [...events, event]),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeAttach));
+      const output = yield* Deferred.make<void>();
+      const exited = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribe((event) =>
+        event.type === "output"
+          ? Deferred.succeed(output, undefined).pipe(Effect.asVoid)
+          : event.type === "exited"
+            ? Deferred.succeed(exited, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      const process = adapter.processes[0]!;
+      process.pid = 12345;
+      process.emitData("Windows prompt> ");
+      yield* Deferred.await(output);
+      const ready = yield* manager.open(openInput());
+      assert.equal(ready.pid, 12345);
+      assert.equal(ready.history, "Windows prompt> ");
+      assert.equal((yield* readMetadata)[0]?.pid, 12345);
+      yield* manager.closeIdle({ threadId: "thread-1" });
+      expect(inspectedPids).toContain(12345);
+      expect(inspectedPids).not.toContain(0);
+      expect(yield* Ref.get(attached)).toContainEqual(
+        expect.objectContaining({ type: "output", data: "Windows prompt> " }),
+      );
+
+      process.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exited);
+      const finalMetadata = yield* readMetadata;
+      assert.equal(finalMetadata[0]?.status, "exited");
+      assert.equal(finalMetadata[0]?.pid, null);
     }),
   );
 

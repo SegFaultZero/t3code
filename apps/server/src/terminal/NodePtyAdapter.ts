@@ -1,4 +1,5 @@
 import * as NodeModule from "node:module";
+import * as NodeNet from "node:net";
 
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -81,6 +82,76 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
   // Best-effort: avoid FileSystem.stat in packaged mode where some fs metadata can be missing.
   yield* fs.chmod(helperPath, 0o755).pipe(Effect.orElseSucceed(() => undefined));
 });
+
+// node-pty now defers Windows process creation to avoid blocking on named pipes:
+// https://github.com/microsoft/node-pty/pull/885
+// T3 adopted that behavior when upgrading from 1.1.0 to 1.2.0-beta.15:
+// https://github.com/pingdotgg/t3code/pull/13748
+// Its public API has no readiness event. The private ready_datapipe handler sets
+// pid before our listener runs; wait here so the manager always receives a real PID.
+const waitForWindowsPid = (process: import("node-pty").IPty, shell: string) =>
+  Effect.callback<void, PtyAdapter.PtySpawnError>((resume) => {
+    const hasPid = () => Number.isInteger(process.pid) && process.pid > 0;
+    const failure = (cause: unknown) =>
+      Effect.fail(new PtyAdapter.PtySpawnError({ adapter: "node-pty", shell, cause }));
+
+    if (hasPid()) {
+      resume(Effect.void);
+      return;
+    }
+
+    if (!("_socket" in process) || !(process._socket instanceof NodeNet.Socket)) {
+      resume(failure(new Error("Windows PTY readiness socket is unavailable.")));
+      return;
+    }
+
+    const socket = process._socket;
+    const onReady = () => {
+      cleanup();
+      resume(
+        hasPid()
+          ? Effect.void
+          : failure(new Error("Windows PTY became ready without a valid PID.")),
+      );
+    };
+    const onError = (cause: Error) => {
+      cleanup();
+      resume(failure(cause));
+    };
+    const onClose = () => onError(new Error("Windows PTY closed before its PID was available."));
+    const exitListener = process.onExit(({ exitCode }) =>
+      onError(
+        new Error(`Windows PTY exited before its PID was available (exit code ${exitCode}).`),
+      ),
+    );
+    const cleanup = () => {
+      socket.off("ready_datapipe", onReady);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      exitListener.dispose();
+    };
+    socket.once("ready_datapipe", onReady);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    return Effect.sync(cleanup);
+  });
+
+const killStartingWindowsPty = (process: import("node-pty").IPty) =>
+  Effect.try(() => {
+    // Public kill() waits for the first output on Windows. The agent can cancel
+    // the pending connection even when no child or output exists yet.
+    if (
+      "_agent" in process &&
+      typeof process._agent === "object" &&
+      process._agent !== null &&
+      "kill" in process._agent &&
+      typeof process._agent.kill === "function"
+    ) {
+      process._agent.kill();
+    } else {
+      process.kill();
+    }
+  }).pipe(Effect.ignore);
 
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
@@ -181,6 +252,11 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
             cause,
           }),
       });
+      if (platform === "win32") {
+        yield* waitForWindowsPid(ptyProcess, input.shell).pipe(
+          Effect.onError(() => killStartingWindowsPty(ptyProcess)),
+        );
+      }
       return new NodePtyProcess(ptyProcess, platform);
     }),
   });
